@@ -1,28 +1,47 @@
-import 'package:hive/hive.dart';
+import 'package:flutter/foundation.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 import '../models/series.dart';
 
 class SeriesRepository {
-  final Box<Series> _box = Hive.box<Series>('seriesBox');
+  static Box<Series> get box => Hive.box<Series>('seriesBox');
 
-  List<Series> getAll() => _box.values.toList();
+  /// Notifies whenever the box changes, so screens rebuild automatically.
+  static ValueListenable<Box<Series>> listenable() => box.listenable();
+
+  List<Series> getAll() => box.values.toList();
 
   List<Series> getFavourites() =>
-      _box.values.where((s) => s.isFavourite).toList();
+      box.values.where((s) => s.isFavourite).toList();
 
   List<Series> getFollowing() =>
-      _box.values.where((s) => s.isFollowing).toList();
+      box.values.where((s) => s.isFollowing).toList();
 
-  Future<void> addSeries(Series series) async {
-    await _box.add(series);
+  /// Source URL is the de-facto identity of a series across sites.
+  Series? findBySourceUrl(String sourceUrl) {
+    for (final s in box.values) {
+      if (s.sourceUrl == sourceUrl) return s;
+    }
+    return null;
   }
 
-  Future<void> updateSeries(Series series) async {
-    await series.save();
+  /// Single-pass index for screens that check many titles at once.
+  Map<String, Series> indexBySourceUrl() {
+    return {for (final s in box.values) s.sourceUrl: s};
   }
 
-  Future<void> deleteSeries(Series series) async {
-    await series.delete();
+  /// Returns the existing entry if it's already saved, otherwise adds it.
+  Future<Series> addIfAbsent(Series series) async {
+    final existing = findBySourceUrl(series.sourceUrl);
+    if (existing != null) return existing;
+    await box.add(series);
+    return series;
   }
+
+  Future<void> addSeries(Series series) async => box.add(series);
+
+  Future<void> updateSeries(Series series) async => series.save();
+
+  Future<void> deleteSeries(Series series) async => series.delete();
 
   Future<void> toggleFavourite(Series series) async {
     series.isFavourite = !series.isFavourite;

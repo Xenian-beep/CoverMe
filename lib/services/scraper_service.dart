@@ -7,6 +7,11 @@ import 'scraper_config_service.dart';
 class ScraperService {
   static Map<String, dynamic>? _rulesCache;
 
+  static const Map<String, String> _defaultHeaders = {
+    'User-Agent':
+        'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36',
+  };
+
   static Future<void> initRules() async {
     _rulesCache = await ScraperConfigService.loadRules();
   }
@@ -16,6 +21,36 @@ class ScraperService {
   static Map<String, dynamic>? getSiteConfig(String site) {
     final rule = _rulesCache?[site];
     return rule == null ? null : Map<String, dynamic>.from(rule);
+  }
+
+  /// Headers needed to load cover images for a site. Many hosts hotlink-block,
+  /// so the Referer comes from that site's own rule rather than being global.
+  static Map<String, String> coverHeaders(String site) {
+    final referer = _rulesCache?[site]?['coverReferer'];
+    if (referer is String && referer.isNotEmpty) {
+      return {..._defaultHeaders, 'Referer': referer};
+    }
+    return _defaultHeaders;
+  }
+
+  /// True if the site exposes a genre-specific listing URL for this genre.
+  static bool siteSupportsGenre(String site, String genre) {
+    final rule = _rulesCache?[site];
+    if (rule?['genreUrlTemplate'] is! String) return false;
+    final genres = rule?['genres'];
+    return genres is List && genres.map((g) => g.toString()).contains(genre);
+  }
+
+  /// Listing URL for a site, optionally narrowed to a genre.
+  static String? listingUrlFor(String site, {String? genre}) {
+    final rule = _rulesCache?[site];
+    if (rule == null) return null;
+    if (genre != null) {
+      if (!siteSupportsGenre(site, genre)) return null;
+      return (rule['genreUrlTemplate'] as String).replaceAll('{genre}', genre);
+    }
+    final def = rule['defaultListingUrl'];
+    return def is String && def.isNotEmpty ? def : null;
   }
 
   static Future<String?> fetchLatestChapter({
@@ -28,10 +63,9 @@ class ScraperService {
     if (rule == null) return null;
 
     try {
-      final response = await http.get(
-        Uri.parse(url),
-        headers: {'User-Agent': 'Mozilla/5.0'},
-      );
+      final response = await http
+          .get(Uri.parse(url), headers: _defaultHeaders)
+          .timeout(const Duration(seconds: 15));
       if (response.statusCode != 200) return null;
 
       final document = html_parser.parse(response.body);
@@ -44,16 +78,14 @@ class ScraperService {
         if (href == null) return null;
         final match = RegExp(pattern).firstMatch(href);
         return match != null && match.groupCount >= 1 ? match.group(1) : null;
-      } else {
-        return _extractBySelector(document, rule);
       }
+      return _extractBySelector(document, rule);
     } catch (_) {
       return null;
     }
   }
 
-  /// NEW: fetches the series page live and finds the "first chapter" /
-  /// "Start Reading" link, returning its full URL (not just a chapter id).
+  /// Fetches the series page and returns the absolute URL of its first chapter.
   static Future<String?> fetchFirstChapterUrl({
     required String seriesUrl,
     required String sourceSite,
@@ -65,27 +97,27 @@ class ScraperService {
     if (matchText.isEmpty) return null;
 
     try {
-      final response = await http.get(
-        Uri.parse(seriesUrl),
-        headers: {'User-Agent': 'Mozilla/5.0'},
-      );
+      final response = await http
+          .get(Uri.parse(seriesUrl), headers: _defaultHeaders)
+          .timeout(const Duration(seconds: 15));
       if (response.statusCode != 200) return null;
 
       final document = html_parser.parse(response.body);
-      return _findHrefByLinkText(document, matchText);
+      final href = _findHrefByLinkText(document, matchText);
+      return href == null ? null : _absolute(href, seriesUrl);
     } catch (_) {
       return null;
     }
   }
 
-  /// Builds a best-effort chapter URL by pattern (e.g. ".../chapter-42").
-  /// Not verified against the real chapter list — may 404 if the number
-  /// doesn't exist on the site.
+  /// Best-effort chapter URL built by pattern. Not verified against the site.
   static String buildChapterUrl({
     required String seriesUrl,
     required String chapterInput,
   }) {
-    final base = seriesUrl.endsWith('/') ? seriesUrl.substring(0, seriesUrl.length - 1) : seriesUrl;
+    final base = seriesUrl.endsWith('/')
+        ? seriesUrl.substring(0, seriesUrl.length - 1)
+        : seriesUrl;
     return '$base/chapter-$chapterInput';
   }
 
@@ -109,15 +141,13 @@ class ScraperService {
     if (itemSelector.isEmpty || titleSelector.isEmpty) return [];
 
     try {
-      final response = await http.get(
-        Uri.parse(listingUrl),
-        headers: {'User-Agent': 'Mozilla/5.0'},
-      );
+      final response = await http
+          .get(Uri.parse(listingUrl), headers: _defaultHeaders)
+          .timeout(const Duration(seconds: 20));
       if (response.statusCode != 200) return [];
 
       final document = html_parser.parse(response.body);
       final items = document.querySelectorAll(itemSelector);
-
       final results = <ScrapedManga>[];
 
       for (final item in items) {
@@ -125,15 +155,17 @@ class ScraperService {
         if (titleEl == null) continue;
 
         final title = titleEl.text.trim();
-        final sourceUrl = titleEl.attributes['href'] ?? '';
-        if (title.isEmpty || sourceUrl.isEmpty) continue;
+        final rawSource = titleEl.attributes['href'] ?? '';
+        if (title.isEmpty || rawSource.isEmpty) continue;
+        final sourceUrl = _absolute(rawSource, listingUrl);
 
         String coverUrl = '';
         if (coverSelector.isNotEmpty) {
           final coverEl = item.querySelector(coverSelector);
-          coverUrl = coverEl?.attributes['data-src'] ??
+          final rawCover = coverEl?.attributes['data-src'] ??
               coverEl?.attributes['src'] ??
               '';
+          if (rawCover.isNotEmpty) coverUrl = _absolute(rawCover, listingUrl);
         }
 
         String latestChapter = '';
@@ -141,13 +173,15 @@ class ScraperService {
         if (chapterLinkSelector.isNotEmpty) {
           final chapterEl = item.querySelector(chapterLinkSelector);
           latestChapter = chapterEl?.text.trim() ?? '';
-          chapterUrl = chapterEl?.attributes['href'] ?? '';
+          final rawChapter = chapterEl?.attributes['href'] ?? '';
+          if (rawChapter.isNotEmpty) {
+            chapterUrl = _absolute(rawChapter, listingUrl);
+          }
         }
 
         String description = '';
         if (descriptionSelector.isNotEmpty) {
-          final descEl = item.querySelector(descriptionSelector);
-          description = descEl?.text.trim() ?? '';
+          description = item.querySelector(descriptionSelector)?.text.trim() ?? '';
         }
 
         results.add(ScrapedManga(
@@ -168,26 +202,30 @@ class ScraperService {
     }
   }
 
+  /// Turns relative and protocol-relative hrefs into absolute URLs.
+  static String _absolute(String href, String baseUrl) {
+    try {
+      return Uri.parse(baseUrl).resolve(href).toString();
+    } catch (_) {
+      return href;
+    }
+  }
+
   static String? _extractBySelector(Document document, Map rule) {
     final List<dynamic> selectors = rule['selectors'] ?? [];
     for (final selector in selectors) {
       final element = document.querySelector(selector as String);
-      if (element != null) {
-        final text = element.text.trim();
-        if (text.isNotEmpty) return text;
-      }
+      final text = element?.text.trim();
+      if (text != null && text.isNotEmpty) return text;
     }
     return null;
   }
 
-  /// Finds an <a> tag by its exact visible text (case-insensitive) and
-  /// returns its href, or null if not found.
   static String? _findHrefByLinkText(Document document, String matchText) {
     if (matchText.isEmpty) return null;
     final normalized = matchText.toLowerCase();
 
-    final anchors = document.querySelectorAll('a');
-    for (final a in anchors) {
+    for (final a in document.querySelectorAll('a')) {
       if (a.text.trim().toLowerCase() == normalized) {
         return a.attributes['href'];
       }

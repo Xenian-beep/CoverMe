@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../models/series.dart';
+import 'cover_image.dart';
 
 class SeriesCard extends StatelessWidget {
   final Series series;
@@ -22,17 +23,11 @@ class SeriesCard extends StatelessWidget {
         leading: Stack(
           clipBehavior: Clip.none,
           children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: series.coverUrl.isNotEmpty
-                  ? Image.network(
-                      series.coverUrl,
-                      width: 48,
-                      height: 64,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, _, _) => _placeholderCover(),
-                    )
-                  : _placeholderCover(),
+            CoverImage(
+              url: series.coverUrl,
+              sourceSite: series.sourceSite,
+              width: 48,
+              height: 64,
             ),
             if (series.hasUpdate)
               Positioned(
@@ -72,15 +67,6 @@ class SeriesCard extends StatelessWidget {
           onPressed: onFavouriteToggle,
         ),
       ),
-    );
-  }
-
-  Widget _placeholderCover() {
-    return Container(
-      width: 48,
-      height: 64,
-      color: Colors.grey.shade300,
-      child: const Icon(Icons.image_not_supported, size: 20),
     );
   }
 }

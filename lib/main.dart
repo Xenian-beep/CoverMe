@@ -12,7 +12,18 @@ void main() async {
   await Hive.initFlutter();
   Hive.registerAdapter(SeriesAdapter());
   await Hive.openBox<Series>('seriesBox');
-  await Hive.openBox('configBox');
+  final configBox = await Hive.openBox('configBox');
+
+  // Restore the saved theme choice, then persist any future change.
+  final saved = configBox.get('themeMode') as String?;
+  themeModeNotifier.value = ThemeMode.values.firstWhere(
+    (m) => m.name == saved,
+    orElse: () => ThemeMode.system,
+  );
+  themeModeNotifier.addListener(
+    () => configBox.put('themeMode', themeModeNotifier.value.name),
+  );
+
   await ScraperService.initRules();
   runApp(const MangaTrackerApp());
 }

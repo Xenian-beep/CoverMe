@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import '../models/scraped_manga.dart';
 import '../models/series.dart';
 import '../services/scraper_service.dart';
 import '../services/services_repository.dart';
+import '../widgets/cover_image.dart';
 
 class DiscoverScreen extends StatefulWidget {
   const DiscoverScreen({super.key});
@@ -37,8 +39,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   List<String> get _availableGenres {
     final genres = <String>{};
     for (final site in ScraperService.supportedSites) {
-      final config = ScraperService.getSiteConfig(site);
-      final siteGenres = config?['genres'];
+      final siteGenres = ScraperService.getSiteConfig(site)?['genres'];
       if (siteGenres is List) {
         genres.addAll(siteGenres.map((g) => g.toString()));
       }
@@ -46,54 +47,38 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
     return genres.toList()..sort();
   }
 
+  /// Fetches every site in parallel; sites that don't carry the selected
+  /// genre are skipped rather than falling back to their full listing.
   Future<void> _loadAllSites({String? genre}) async {
     setState(() {
       _loading = true;
       _activeGenre = genre;
     });
 
-    final results = <ScrapedManga>[];
-
+    final requests = <Future<List<ScrapedManga>>>[];
     for (final site in ScraperService.supportedSites) {
-      final config = ScraperService.getSiteConfig(site);
-      if (config == null) continue;
-
-      String? listingUrl = config['defaultListingUrl'];
-      if (genre != null) {
-        final template = config['genreUrlTemplate'];
-        if (template is String) {
-          listingUrl = template.replaceAll('{genre}', genre);
-        }
-      }
+      final listingUrl = ScraperService.listingUrlFor(site, genre: genre);
       if (listingUrl == null) continue;
-
-      final siteResults = await ScraperService.fetchListing(
-        listingUrl: listingUrl,
-        sourceSite: site,
+      requests.add(
+        ScraperService.fetchListing(listingUrl: listingUrl, sourceSite: site),
       );
-      results.addAll(siteResults);
     }
 
-    if (mounted) {
-      setState(() {
-        _allResults = results;
-        _loading = false;
-      });
-    }
+    final responses = await Future.wait(requests);
+
+    if (!mounted) return;
+    setState(() {
+      _allResults = responses.expand((r) => r).toList();
+      _loading = false;
+    });
   }
 
   List<ScrapedManga> get _filteredResults {
-    if (_searchQuery.trim().isEmpty) return _allResults;
     final query = _searchQuery.trim().toLowerCase();
-    return _allResults.where((m) => m.title.toLowerCase().contains(query)).toList();
-  }
-
-  Series? _matchInLibrary(ScrapedManga manga) {
-    final all = _repo.getAll();
-    for (final s in all) {
-      if (s.sourceUrl == manga.sourceUrl) return s;
-    }
-    return null;
+    if (query.isEmpty) return _allResults;
+    return _allResults
+        .where((m) => m.title.toLowerCase().contains(query))
+        .toList();
   }
 
   Future<void> _openUrl(String url) async {
@@ -107,9 +92,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   }
 
   Future<void> _openForLibraryItem(ScrapedManga manga, Series matched) async {
-    final hasNewChapter = matched.lastKnownChapter.isNotEmpty &&
-        matched.lastKnownChapter != matched.lastReadChapter;
-    final url = hasNewChapter
+    final url = matched.hasUpdate
         ? (manga.chapterUrl.isNotEmpty ? manga.chapterUrl : manga.sourceUrl)
         : manga.sourceUrl;
     await _openUrl(url);
@@ -123,18 +106,20 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
       sourceSite: manga.sourceSite,
     );
 
-    if (mounted) setState(() => _fetchingRead.remove(manga.sourceUrl));
+    if (!mounted) return;
+    setState(() => _fetchingRead.remove(manga.sourceUrl));
 
     if (firstChapterUrl != null) {
       await _openUrl(firstChapterUrl);
-    } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not find chapter 1 — opening latest chapter instead')),
-        );
-      }
-      await _openUrl(manga.chapterUrl.isNotEmpty ? manga.chapterUrl : manga.sourceUrl);
+      return;
     }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Could not find chapter 1 — opening latest chapter instead'),
+      ),
+    );
+    await _openUrl(manga.chapterUrl.isNotEmpty ? manga.chapterUrl : manga.sourceUrl);
   }
 
   Future<void> _showJumpToChapterDialog(ScrapedManga manga) async {
@@ -159,7 +144,10 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
             const SizedBox(height: 8),
             Text(
               'This builds the link directly — it isn\'t checked against the site, so it may not exist.',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ),
@@ -177,41 +165,39 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
     );
 
     if (result != null && result.isNotEmpty) {
-      final url = ScraperService.buildChapterUrl(seriesUrl: manga.sourceUrl, chapterInput: result);
-      await _openUrl(url);
+      await _openUrl(ScraperService.buildChapterUrl(
+        seriesUrl: manga.sourceUrl,
+        chapterInput: result,
+      ));
     }
   }
 
   Future<void> _addToLibrary(ScrapedManga manga) async {
-    final series = Series(
+    final existing = _repo.findBySourceUrl(manga.sourceUrl);
+    if (existing != null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${manga.title} is already in your library')),
+        );
+      }
+      return;
+    }
+
+    await _repo.addSeries(Series(
       title: manga.title,
       coverUrl: manga.coverUrl,
       sourceUrl: manga.sourceUrl,
       category: _activeGenre ?? 'Manga',
       lastKnownChapter: manga.latestChapter,
+      lastReadChapter: manga.latestChapter,
       sourceSite: manga.sourceSite,
-    );
-    await _repo.addSeries(series);
+    ));
+
     if (mounted) {
-      setState(() {});
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('${manga.title} added to library')),
       );
     }
-  }
-
-  Future<void> _toggleFavourite(Series series) async {
-    setState(() {
-      series.isFavourite = !series.isFavourite;
-      series.save();
-    });
-  }
-
-  Future<void> _toggleFollowing(Series series) async {
-    setState(() {
-      series.isFollowing = !series.isFollowing;
-      series.save();
-    });
   }
 
   @override
@@ -287,159 +273,172 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
                 ? const Center(child: CircularProgressIndicator())
                 : results.isEmpty
                     ? const Center(child: Text('No manga found'))
-                    : ListView.builder(
-                        padding: const EdgeInsets.symmetric(horizontal: 12),
-                        itemCount: results.length,
-                        itemBuilder: (context, index) {
-                          final manga = results[index];
-                          final matched = _matchInLibrary(manga);
-                          final hasNewChapter = matched != null &&
-                              matched.lastKnownChapter.isNotEmpty &&
-                              matched.lastKnownChapter != matched.lastReadChapter;
-                          final isFetchingRead = _fetchingRead.contains(manga.sourceUrl);
+                    : ValueListenableBuilder<Box<Series>>(
+                        valueListenable: SeriesRepository.listenable(),
+                        builder: (context, box, _) {
+                          // Built once per rebuild instead of per row.
+                          final library = _repo.indexBySourceUrl();
 
-                          return Card(
-                            margin: const EdgeInsets.only(bottom: 10),
-                            child: Padding(
-                              padding: const EdgeInsets.all(10),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  ClipRRect(
-                                    borderRadius: BorderRadius.circular(6),
-                                    child: manga.coverUrl.isNotEmpty
-                                        ? Image.network(
-                                            manga.coverUrl,
-                                            width: 64,
-                                            height: 90,
-                                            fit: BoxFit.cover,
-                                            headers: const {'Referer': 'https://www.manganato.gg/'},
-                                            errorBuilder: (_, _, _) =>
-                                                Container(width: 64, height: 90, color: Colors.grey.shade300),
-                                          )
-                                        : Container(width: 64, height: 90, color: Colors.grey.shade300),
-                                  ),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Row(
-                                          children: [
-                                            Expanded(
-                                              child: Text(
-                                                manga.title,
-                                                maxLines: 2,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: const TextStyle(fontWeight: FontWeight.w600),
-                                              ),
-                                            ),
-                                            if (hasNewChapter)
-                                              Container(
-                                                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-                                                decoration: BoxDecoration(
-                                                  color: Theme.of(context).colorScheme.error,
-                                                  borderRadius: BorderRadius.circular(6),
-                                                ),
-                                                child: const Text(
-                                                  'NEW',
-                                                  style: TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
-                                                ),
-                                              ),
-                                          ],
-                                        ),
-                                        const SizedBox(height: 4),
-                                        Wrap(
-                                          spacing: 6,
-                                          children: [
-                                            Chip(
-                                              label: Text(manga.sourceDisplayName, style: const TextStyle(fontSize: 10)),
-                                              visualDensity: VisualDensity.compact,
-                                              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                                            ),
-                                            if (_activeGenre != null)
-                                              Chip(
-                                                label: Text(_activeGenre!, style: const TextStyle(fontSize: 10)),
-                                                visualDensity: VisualDensity.compact,
-                                                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                                              ),
-                                          ],
-                                        ),
-                                        if (manga.description.isNotEmpty) ...[
-                                          const SizedBox(height: 4),
-                                          Text(
-                                            manga.description,
-                                            maxLines: 2,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-                                          ),
-                                        ],
-                                        const SizedBox(height: 8),
-                                        Row(
-                                          children: [
-                                            OutlinedButton.icon(
-                                              onPressed: isFetchingRead
-                                                  ? null
-                                                  : () => matched != null
-                                                      ? _openForLibraryItem(manga, matched)
-                                                      : _openFirstChapter(manga),
-                                              icon: isFetchingRead
-                                                  ? const SizedBox(
-                                                      width: 14,
-                                                      height: 14,
-                                                      child: CircularProgressIndicator(strokeWidth: 2),
-                                                    )
-                                                  : const Icon(Icons.open_in_new, size: 16),
-                                              label: Text(matched != null && !hasNewChapter ? 'Continue' : 'Read'),
-                                              style: OutlinedButton.styleFrom(
-                                                padding: const EdgeInsets.symmetric(horizontal: 10),
-                                                visualDensity: VisualDensity.compact,
-                                              ),
-                                            ),
-                                            IconButton(
-                                              icon: const Icon(Icons.playlist_play, size: 20),
-                                              tooltip: 'Jump to chapter',
-                                              onPressed: () => _showJumpToChapterDialog(manga),
-                                              visualDensity: VisualDensity.compact,
-                                            ),
-                                            if (matched == null)
-                                              IconButton(
-                                                icon: const Icon(Icons.add_circle_outline),
-                                                onPressed: () => _addToLibrary(manga),
-                                                visualDensity: VisualDensity.compact,
-                                              )
-                                            else ...[
-                                              IconButton(
-                                                icon: Icon(
-                                                  matched.isFavourite ? Icons.favorite : Icons.favorite_border,
-                                                  color: matched.isFavourite ? Colors.redAccent : null,
-                                                  size: 20,
-                                                ),
-                                                onPressed: () => _toggleFavourite(matched),
-                                                visualDensity: VisualDensity.compact,
-                                              ),
-                                              IconButton(
-                                                icon: Icon(
-                                                  matched.isFollowing ? Icons.bookmark : Icons.bookmark_border,
-                                                  size: 20,
-                                                ),
-                                                onPressed: () => _toggleFollowing(matched),
-                                                visualDensity: VisualDensity.compact,
-                                              ),
-                                            ],
-                                          ],
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ],
-                              ),
+                          return ListView.builder(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            itemCount: results.length,
+                            itemBuilder: (context, index) => _buildCard(
+                              results[index],
+                              library[results[index].sourceUrl],
                             ),
                           );
                         },
                       ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildCard(ScrapedManga manga, Series? matched) {
+    final hasNewChapter = matched?.hasUpdate ?? false;
+    final isFetchingRead = _fetchingRead.contains(manga.sourceUrl);
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      child: Padding(
+        padding: const EdgeInsets.all(10),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            CoverImage(
+              url: manga.coverUrl,
+              sourceSite: manga.sourceSite,
+              width: 64,
+              height: 90,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          manga.title,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                      if (hasNewChapter)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: Theme.of(context).colorScheme.error,
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: const Text(
+                            'NEW',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 9,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Wrap(
+                    spacing: 6,
+                    children: [
+                      Chip(
+                        label: Text(manga.sourceDisplayName,
+                            style: const TextStyle(fontSize: 10)),
+                        visualDensity: VisualDensity.compact,
+                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      if (_activeGenre != null)
+                        Chip(
+                          label: Text(_activeGenre!,
+                              style: const TextStyle(fontSize: 10)),
+                          visualDensity: VisualDensity.compact,
+                          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                    ],
+                  ),
+                  if (manga.description.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      manga.description,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: isFetchingRead
+                            ? null
+                            : () => matched != null
+                                ? _openForLibraryItem(manga, matched)
+                                : _openFirstChapter(manga),
+                        icon: isFetchingRead
+                            ? const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.open_in_new, size: 16),
+                        label: Text(
+                          matched != null && !hasNewChapter ? 'Continue' : 'Read',
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.playlist_play, size: 20),
+                        tooltip: 'Jump to chapter',
+                        onPressed: () => _showJumpToChapterDialog(manga),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                      if (matched == null)
+                        IconButton(
+                          icon: const Icon(Icons.add_circle_outline),
+                          tooltip: 'Add to library',
+                          onPressed: () => _addToLibrary(manga),
+                          visualDensity: VisualDensity.compact,
+                        )
+                      else ...[
+                        IconButton(
+                          icon: Icon(
+                            matched.isFavourite ? Icons.favorite : Icons.favorite_border,
+                            color: matched.isFavourite ? Colors.redAccent : null,
+                            size: 20,
+                          ),
+                          onPressed: () => _repo.toggleFavourite(matched),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        IconButton(
+                          icon: Icon(
+                            matched.isFollowing ? Icons.bookmark : Icons.bookmark_border,
+                            size: 20,
+                          ),
+                          onPressed: () => _repo.toggleFollowing(matched),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

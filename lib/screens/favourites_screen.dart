@@ -1,48 +1,41 @@
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import '../models/series.dart';
 import '../services/services_repository.dart';
 import '../widgets/series_card.dart';
 import 'series_detail_screen.dart';
 
-class FavouritesScreen extends StatefulWidget {
+class FavouritesScreen extends StatelessWidget {
   const FavouritesScreen({super.key});
 
   @override
-  State<FavouritesScreen> createState() => _FavouritesScreenState();
-}
-
-class _FavouritesScreenState extends State<FavouritesScreen> {
-  final SeriesRepository _repo = SeriesRepository();
-
-  @override
   Widget build(BuildContext context) {
-    final favourites = _repo.getFavourites();
+    final repo = SeriesRepository();
 
     return Scaffold(
       appBar: AppBar(title: const Text('Favourites')),
-      body: favourites.isEmpty
-          ? _buildEmptyState(context)
-          : ListView.builder(
-              itemCount: favourites.length,
-              itemBuilder: (context, index) {
-                final series = favourites[index];
-                return SeriesCard(
-                  series: series,
-                  onFavouriteToggle: () {
-                    setState(() {
-                      series.isFavourite = !series.isFavourite;
-                      series.save();
-                    });
-                  },
-                  onTap: () async {
-                    await Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (_) => SeriesDetailScreen(series: series)),
-                    );
-                    setState(() {});
-                  },
-                );
-              },
-            ),
+      body: ValueListenableBuilder<Box<Series>>(
+        valueListenable: SeriesRepository.listenable(),
+        builder: (context, box, _) {
+          final favourites = repo.getFavourites();
+          if (favourites.isEmpty) return _buildEmptyState(context);
+
+          return ListView.builder(
+            itemCount: favourites.length,
+            itemBuilder: (context, index) {
+              final series = favourites[index];
+              return SeriesCard(
+                series: series,
+                onFavouriteToggle: () => repo.toggleFavourite(series),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => SeriesDetailScreen(series: series)),
+                ),
+              );
+            },
+          );
+        },
+      ),
     );
   }
 
@@ -63,17 +56,19 @@ class _FavouritesScreenState extends State<FavouritesScreen> {
             const SizedBox(height: 20),
             Text(
               'No favourites yet',
-              style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                    fontWeight: FontWeight.w600,
-                  ),
+              style: Theme.of(context)
+                  .textTheme
+                  .titleLarge
+                  ?.copyWith(fontWeight: FontWeight.w600),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 8),
             Text(
               'Tap the heart on any series to add it here',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: colorScheme.onSurfaceVariant,
-                  ),
+              style: Theme.of(context)
+                  .textTheme
+                  .bodyMedium
+                  ?.copyWith(color: colorScheme.onSurfaceVariant),
               textAlign: TextAlign.center,
             ),
           ],

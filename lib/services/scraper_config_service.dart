@@ -5,7 +5,7 @@ import 'package:hive/hive.dart';
 class ScraperConfigService {
   
   static const String configUrl =
-    'https://gist.githubusercontent.com/Xenian-beep/6845cd754318d18ee5351926dc604645/raw/5fb0ddbd55b9bfa807d52fd4351c0f355a948ea5/scraper_rules.json';
+    'https://gist.githubusercontent.com/Xenian-beep/6845cd754318d18ee5351926dc604645/raw/6a331217025098834364e22afda4e32e12315c90/scraper_rules.json';
 
   static const String _cacheKey = 'cachedRules';
 
