@@ -45,7 +45,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Manga Tracker'),
+        title: const Text('Series Tracker'),
         actions: [
           PopupMenuButton<SortOption>(
             icon: const Icon(Icons.sort),
